@@ -138,7 +138,7 @@ def _supports_stop_sequences(model_id: str) -> bool:
     if model_lower.startswith("qwen."):
         return False
 
-    if any(no_stop_model in model_lower for no_stop_model in NO_STOP_SEQUENCES_MODELS):
+    if model_lower in NO_STOP_SEQUENCES_MODELS:
         return False
 
     return True
@@ -350,9 +350,21 @@ class BedrockModel(BaseChatModel):
         bedrock_model_list = list_bedrock_models()
         return list(bedrock_model_list.keys())
 
+    @staticmethod
+    def _enforce_model_whitelist(model_id: str) -> None:
+        if _MODEL_WHITELIST and not _is_allowed_by_whitelist(model_id, _MODEL_WHITELIST):
+            logger.warning("Blocked model by whitelist policy: %s", model_id)
+            raise HTTPException(
+                status_code=403,
+                detail=f"Model {model_id} is not allowed by whitelist",
+            )
+
     def validate(self, chat_request: ChatRequest):
         """Perform basic validation on requests"""
         error = ""
+
+        self._enforce_model_whitelist(chat_request.model)
+
         # check if model is supported
         if chat_request.model not in bedrock_model_list.keys():
             # Refresh model catalog once to avoid stale startup cache causing false negatives.
@@ -937,6 +949,7 @@ class BedrockModel(BaseChatModel):
 
         Ref: https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html
         """
+        self._enforce_model_whitelist(chat_request.model)
         messages = self._parse_messages(chat_request)
         system_prompts = self._parse_system_prompts(chat_request)
 
@@ -1364,9 +1377,7 @@ class BedrockModel(BaseChatModel):
         model_id: str,
     ) -> list[dict]:
         def _safe_text(text: str | None) -> str:
-            if text is None:
-                return ""
-            return text if text.strip() else "[empty message omitted by proxy]"
+            return text if text is not None else ""
 
         if isinstance(message.content, str):
             return [
