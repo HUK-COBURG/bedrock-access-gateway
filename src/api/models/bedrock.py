@@ -138,7 +138,7 @@ def _supports_stop_sequences(model_id: str) -> bool:
     if model_lower.startswith("qwen."):
         return False
 
-    if any(no_stop_model in model_lower for no_stop_model in NO_STOP_SEQUENCES_MODELS):
+    if model_lower in NO_STOP_SEQUENCES_MODELS:
         return False
 
     return True
@@ -350,9 +350,21 @@ class BedrockModel(BaseChatModel):
         bedrock_model_list = list_bedrock_models()
         return list(bedrock_model_list.keys())
 
+    @staticmethod
+    def _enforce_model_whitelist(model_id: str) -> None:
+        if _MODEL_WHITELIST and not _is_allowed_by_whitelist(model_id, _MODEL_WHITELIST):
+            logger.warning("Blocked model by whitelist policy: %s", model_id)
+            raise HTTPException(
+                status_code=403,
+                detail=f"Model {model_id} is not allowed by whitelist",
+            )
+
     def validate(self, chat_request: ChatRequest):
         """Perform basic validation on requests"""
         error = ""
+
+        self._enforce_model_whitelist(chat_request.model)
+
         # check if model is supported
         if chat_request.model not in bedrock_model_list.keys():
             # Refresh model catalog once to avoid stale startup cache causing false negatives.
@@ -701,14 +713,16 @@ class BedrockModel(BaseChatModel):
         messages = []
         for message in chat_request.messages:
             if isinstance(message, UserMessage):
-                messages.append(
-                    {
-                        "role": message.role,
-                        "content": self._parse_content_parts(
-                            message, chat_request.model
-                        ),
-                    }
-                )
+                parsed_content = self._parse_content_parts(message, chat_request.model)
+                if parsed_content:
+                    messages.append(
+                        {
+                            "role": message.role,
+                            "content": parsed_content,
+                        }
+                    )
+                elif DEBUG:
+                    logger.info("Skipped empty user content block for model %s", chat_request.model)
             elif isinstance(message, AssistantMessage):
                 # Check if message has content that's not empty
                 has_content = False
@@ -721,14 +735,16 @@ class BedrockModel(BaseChatModel):
 
                 if has_content:
                     # Text message
-                    messages.append(
-                        {
-                            "role": message.role,
-                            "content": self._parse_content_parts(
-                                message, chat_request.model
-                            ),
-                        }
-                    )
+                    parsed_content = self._parse_content_parts(message, chat_request.model)
+                    if parsed_content:
+                        messages.append(
+                            {
+                                "role": message.role,
+                                "content": parsed_content,
+                            }
+                        )
+                    elif DEBUG:
+                        logger.info("Skipped empty assistant content block for model %s", chat_request.model)
                 if message.tool_calls:
                     # Tool use message
                     for tool_call in message.tool_calls:
@@ -937,6 +953,7 @@ class BedrockModel(BaseChatModel):
 
         Ref: https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_Converse.html
         """
+        self._enforce_model_whitelist(chat_request.model)
         messages = self._parse_messages(chat_request)
         system_prompts = self._parse_system_prompts(chat_request)
 
@@ -1366,22 +1383,21 @@ class BedrockModel(BaseChatModel):
         def _safe_text(text: str | None) -> str:
             if text is None:
                 return ""
-            return text if text.strip() else "[empty message omitted by proxy]"
+            return text if text.strip() else ""
 
         if isinstance(message.content, str):
-            return [
-                {
-                    "text": _safe_text(message.content),
-                }
-            ]
+            safe_text = _safe_text(message.content)
+            return [{"text": safe_text}] if safe_text else []
         content_parts = []
         for part in message.content:
             if isinstance(part, TextContent):
-                content_parts.append(
-                    {
-                        "text": _safe_text(part.text),
-                    }
-                )
+                safe_text = _safe_text(part.text)
+                if safe_text:
+                    content_parts.append(
+                        {
+                            "text": safe_text,
+                        }
+                    )
             elif isinstance(part, ImageContent):
                 if not self.is_supported_modality(model_id, modality="IMAGE"):
                     raise HTTPException(
